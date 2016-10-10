@@ -16,6 +16,7 @@ import cmd_options
 import dataset
 from dataset import PreprocessedDataset
 from densenet import DenseNet
+from evaluator import Evaluator
 from graph import create_fig
 
 def main(args):
@@ -45,18 +46,17 @@ def main(args):
     test_iter = chainer.iterators.MultiprocessIterator(
         test, args.batchsize, repeat=False, shuffle=False)
 
-    model = chainer.links.Classifier(DenseNet(
-        n_layer, args.growth_rate, n_class, args.drop_ratio, 16, args.block))
+    model = chainer.links.Classifier(DenseNet(n_layer, args.growth_rate, n_class, args.drop_ratio, 16, args.block))
     if args.init_model:
         serializers.load_npz(args.init_model, model)
 
     import EXoptimizers
-    optimizer = EXoptimizers.EXNesterovAG(lr=args.lr / len(args.gpus), momentum=0.9)
+    optimizer = EXoptimizers.originalNesterovAG(lr=args.lr / len(args.gpus), momentum=0.9)
     optimizer.setup(model)
     optimizer.add_hook(chainer.optimizer.WeightDecay(args.weight_decay))
 
     devices = {'main': args.gpus[0]}
-    if len(args.gpus) > 2:
+    if len(args.gpus) > 1:
         for gid in args.gpus[1:]:
             devices['gpu%d' % gid] = gid
     updater = training.ParallelUpdater(train_iter, optimizer, devices=devices)
@@ -65,15 +65,16 @@ def main(args):
     val_interval = (1, 'epoch')
     log_interval = (1, 'epoch')
 
-    eval_model = model.copy()
-    eval_model.train = False
+    def lr_shift():  # DenseNet specific!
+        if updater.epoch == 151 or updater.epoch == 226:
+            optimizer.lr *= 0.1
+        return optimizer.lr
 
-    trainer.extend(extensions.Evaluator(
-        test_iter, eval_model, device=args.gpus[0]), trigger=val_interval)
-
-    import EXextensions
-    trainer.extend(EXextensions.cifarShift('lr', (0.1,0.01,0.001), (150,225)), trigger=val_interval)#default epoch<=150 lr = 0.1, 150<epoch<=225 lr = 0.01, else lr = 0.001
-    
+    trainer.extend(Evaluator(
+        test_iter, model, device=args.gpus[0]), trigger=val_interval)
+    trainer.extend(extensions.observe_value(
+        'lr', lambda _: lr_shift()), trigger=(1, 'epoch'))
+    trainer.extend(extensions.dump_graph('main/loss'))
     trainer.extend(extensions.snapshot_object(
         model, 'epoch_{.updater.epoch}.model'), trigger=val_interval)
     trainer.extend(extensions.snapshot_object(
